@@ -205,6 +205,18 @@ func NewPaymentConfigService(entClient *dbent.Client, settingRepo SettingReposit
 	return &PaymentConfigService{entClient: entClient, settingRepo: settingRepo, encryptionKey: encryptionKey}
 }
 
+// GetSettingValue returns a raw setting value ("" if not found or on error).
+func (s *PaymentConfigService) GetSettingValue(ctx context.Context, key string) string {
+	if s == nil || s.settingRepo == nil {
+		return ""
+	}
+	val, err := s.settingRepo.GetValue(ctx, key)
+	if err != nil {
+		return ""
+	}
+	return val
+}
+
 // IsPaymentEnabled returns whether the payment system is enabled.
 func (s *PaymentConfigService) IsPaymentEnabled(ctx context.Context) bool {
 	val, err := s.settingRepo.GetValue(ctx, SettingPaymentEnabled)

@@ -30,6 +30,9 @@ var ErrOrderNotFound = errors.New("payment order not found")
 
 const paymentFulfillmentLeaseDuration = 5 * time.Minute
 
+// SettingRechargeBonusTiers 充值阶梯奖励配置（JSON: [{"min":50,"bonus":5}]）
+const SettingRechargeBonusTiers = "RECHARGE_BONUS_TIERS"
+
 type paymentFulfillmentLease struct {
 	version time.Time
 }
@@ -350,10 +353,86 @@ func (s *PaymentService) doBalance(ctx context.Context, o *dbent.PaymentOrder, l
 	if _, err := s.redeemService.Redeem(ContextSkipRedeemAffiliate(ctx), o.UserID, o.RechargeCode); err != nil {
 		return fmt.Errorf("redeem balance: %w", err)
 	}
+
+	// Tiered recharge bonus: apply bonus credits based on recharge amount
+	if bonus := s.calculateRechargeBonus(o.Amount); bonus > 0 {
+		if err := s.applyRechargeBonus(ctx, o, bonus); err != nil {
+			slog.Error("recharge bonus failed", "orderID", o.ID, "bonus", bonus, "error", err)
+			// Don't fail the entire order for bonus errors
+		}
+	}
+
 	if err := s.applyAffiliateRebateForOrder(ctx, o); err != nil {
 		return err
 	}
 	return s.markCompleted(ctx, o, lease, "RECHARGE_SUCCESS")
+}
+
+// calculateRechargeBonus returns the bonus amount based on recharge tiers.
+// Tiers are stored in settings as JSON: [{"min":50,"bonus":5},{"min":100,"bonus":15}]
+// Returns 0 if no tier matches or tiers are not configured.
+func (s *PaymentService) calculateRechargeBonus(amount float64) float64 {
+	tiersJSON := s.getSettingValue(SettingRechargeBonusTiers)
+	if tiersJSON == "" {
+		return 0
+	}
+
+	type tier struct {
+		Min   float64 `json:"min"`
+		Bonus float64 `json:"bonus"`
+	}
+
+	var tiers []tier
+	if err := json.Unmarshal([]byte(tiersJSON), &tiers); err != nil {
+		slog.Error("failed to parse recharge bonus tiers", "error", err)
+		return 0
+	}
+
+	// Find the highest matching tier
+	var bestBonus float64
+	for _, t := range tiers {
+		if amount >= t.Min && t.Bonus > bestBonus {
+			bestBonus = t.Bonus
+		}
+	}
+	return bestBonus
+}
+
+// applyRechargeBonus credits bonus amount to the user's balance.
+func (s *PaymentService) applyRechargeBonus(ctx context.Context, o *dbent.PaymentOrder, bonus float64) error {
+	if bonus <= 0 {
+		return nil
+	}
+
+	// Create a redeem code for the bonus
+	bonusCode := fmt.Sprintf("bonus_%s_%d", o.RechargeCode, time.Now().UnixMilli())
+	rc := &RedeemCode{Code: bonusCode, Type: RedeemTypeBalance, Value: bonus, Status: StatusUnused}
+	if err := s.redeemService.CreateCode(ctx, rc); err != nil {
+		return fmt.Errorf("create bonus redeem code: %w", err)
+	}
+
+	// Redeem the bonus code
+	if _, err := s.redeemService.Redeem(ContextSkipRedeemAffiliate(ctx), o.UserID, bonusCode); err != nil {
+		return fmt.Errorf("redeem bonus: %w", err)
+	}
+
+	s.writeAuditLog(ctx, o.ID, "RECHARGE_BONUS_APPLIED", "system", map[string]any{
+		"bonusAmount": bonus,
+		"bonusCode":   bonusCode,
+	})
+
+	slog.Info("recharge bonus applied", "orderID", o.ID, "bonus", bonus, "code", bonusCode)
+	return nil
+}
+
+// getSettingValue retrieves a setting value from the database.
+func (s *PaymentService) getSettingValue(key string) string {
+	if s.configService == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.configService.GetSettingValue(ctx, key)
 }
 
 func (s *PaymentService) markCompleted(ctx context.Context, o *dbent.PaymentOrder, lease *paymentFulfillmentLease, auditAction string) error {
