@@ -691,7 +691,6 @@ export default {
         balanceRechargeMultiplierHint: '用户每支付 1 CNY 可获得多少 USD 余额',
         balanceRechargePreview: '预览：1 CNY = {usd} USD',
         rechargeBonusTiers: '充值阶梯奖励（JSON）',
-        rechargeBonusTiersPlaceholder: '[{"min":100,"bonus":10},{"min":200,"bonus":30,"multiplier":1.15}]',
         rechargeBonusTiersHint:
           '充到 min 金额送 bonus 余额；multiplier 为该档位专属到账倍率（0 或省略 = 跟随全局余额充值倍率）。留空使用内置默认档位',
         rechargeBonusTiersInvalid: 'JSON 无效：需要非空数组，min>0 且递增、bonus≥0、multiplier≥0',

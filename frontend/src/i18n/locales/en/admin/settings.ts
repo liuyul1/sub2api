@@ -696,7 +696,6 @@ export default {
         balanceRechargeMultiplierHint: 'How many USD balance the user receives for each 1 CNY paid',
         balanceRechargePreview: 'Preview: 1 CNY = {usd} USD',
         rechargeBonusTiers: 'Recharge Bonus Tiers (JSON)',
-        rechargeBonusTiersPlaceholder: '[{"min":100,"bonus":10},{"min":200,"bonus":30,"multiplier":1.15}]',
         rechargeBonusTiersHint:
           'Recharge min amount to get bonus balance. multiplier is the tier-specific credit rate (0 or omitted = follow global balance multiplier). Empty = built-in default tiers',
         rechargeBonusTiersInvalid: 'Invalid JSON: non-empty array required, min>0 and strictly increasing, bonus>=0, multiplier>=0',

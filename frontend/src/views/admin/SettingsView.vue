@@ -7799,11 +7799,7 @@
                       rows="5"
                       spellcheck="false"
                       class="input font-mono text-xs"
-                      :placeholder="
-                        t(
-                          'admin.settings.payment.rechargeBonusTiersPlaceholder',
-                        )
-                      "
+                      placeholder='[{"min":100,"bonus":10},{"min":200,"bonus":30,"multiplier":1.15}]'
                     ></textarea>
                     <p
                       v-if="rechargeBonusTiersError"
