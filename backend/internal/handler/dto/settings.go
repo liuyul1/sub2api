@@ -292,6 +292,9 @@ type SystemSettings struct {
 	// Use Alipay face-to-face precreate and an app deep link on mobile clients.
 	PaymentAlipayMobilePrecreateDeepLink bool `json:"payment_alipay_mobile_precreate_deep_link"`
 
+	// 充值阶梯奖励配置 JSON
+	PaymentRechargeBonusTiers string `json:"payment_recharge_bonus_tiers"`
+
 	// 余额、订阅到期与账号限额通知
 	BalanceLowNotifyEnabled         bool               `json:"balance_low_notify_enabled"`
 	BalanceLowNotifyThreshold       float64            `json:"balance_low_notify_threshold"`

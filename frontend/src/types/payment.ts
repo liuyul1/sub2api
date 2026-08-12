@@ -78,6 +78,14 @@ export interface CheckoutInfoResponse {
   alipay_force_qrcode?: boolean
   /** When true, official Alipay mobile orders use precreate plus an Alipay app deep link */
   alipay_mobile_precreate_deep_link?: boolean
+  /** 充值阶梯奖励档位（充X送Y，Y为赠送余额；multiplier 为档位专属到账倍率，0=跟随全局） */
+  recharge_bonus_tiers?: RechargeBonusTier[]
+}
+
+export interface RechargeBonusTier {
+  min: number
+  bonus: number
+  multiplier?: number
 }
 
 // ==================== Orders ====================

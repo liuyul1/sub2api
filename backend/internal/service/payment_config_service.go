@@ -2,11 +2,17 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/paymentproviderinstance"
@@ -40,13 +46,109 @@ const (
 	SettingCancelWindowMode              = "CANCEL_RATE_LIMIT_WINDOW_MODE"
 	SettingAlipayForceQRCode             = "ALIPAY_FORCE_QRCODE"
 	SettingAlipayMobilePrecreateDeepLink = "ALIPAY_MOBILE_PRECREATE_DEEP_LINK"
+	// SettingRechargeBonusTiers 充值阶梯奖励配置（JSON: [{"min":100,"bonus":10,"multiplier":1.1}]）
+	// multiplier 为该档位专属到账倍率（0=跟随全局 BALANCE_RECHARGE_MULTIPLIER）。
+	SettingRechargeBonusTiers = "RECHARGE_BONUS_TIERS"
 )
 
 // Default values for payment configuration settings.
 const (
 	defaultOrderTimeoutMin  = 30
 	defaultMaxPendingOrders = 3
+	rechargeBonusCacheTTL   = 5 * time.Minute
 )
+
+// RechargeBonusTier 充值阶梯奖励档位。
+type RechargeBonusTier struct {
+	Min   float64 `json:"min"`
+	Bonus float64 `json:"bonus"`
+	// Multiplier 为 0 时跟随全局 BALANCE_RECHARGE_MULTIPLIER。
+	Multiplier float64 `json:"multiplier,omitempty"`
+}
+
+// DefaultRechargeBonusTiers 未配置 RECHARGE_BONUS_TIERS 时的内置默认档位。
+// 比例参考：充100送10（10%）、充200送30（15%）、充500送90（18%）、充1000送200（20%）。
+var DefaultRechargeBonusTiers = []RechargeBonusTier{
+	{Min: 100, Bonus: 10},
+	{Min: 200, Bonus: 30, Multiplier: 1.15},
+	{Min: 500, Bonus: 90, Multiplier: 1.25},
+	{Min: 1000, Bonus: 200, Multiplier: 1.35},
+}
+
+// defaultRechargeBonusTiersJSON 是默认档位的 JSON 序列化，用于配置为空时落库兜底。
+const defaultRechargeBonusTiersJSON = `[{"min":100,"bonus":10},{"min":200,"bonus":30,"multiplier":1.15},{"min":500,"bonus":90,"multiplier":1.25},{"min":1000,"bonus":200,"multiplier":1.35}]`
+
+// ParseRechargeBonusTiers 解析并校验档位配置 JSON。
+// 规则：min>0、bonus>=0、multiplier>=0；按 min 升序（重复 min 报错）；解析失败返回 error。
+func ParseRechargeBonusTiers(raw string) ([]RechargeBonusTier, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var tiers []RechargeBonusTier
+	if err := json.Unmarshal([]byte(raw), &tiers); err != nil {
+		return nil, fmt.Errorf("parse recharge bonus tiers: %w", err)
+	}
+	if len(tiers) == 0 {
+		return nil, fmt.Errorf("recharge bonus tiers must not be empty")
+	}
+	for i, t := range tiers {
+		if math.IsNaN(t.Min) || math.IsInf(t.Min, 0) || t.Min <= 0 {
+			return nil, fmt.Errorf("tier %d: min must be a positive number", i)
+		}
+		if math.IsNaN(t.Bonus) || math.IsInf(t.Bonus, 0) || t.Bonus < 0 {
+			return nil, fmt.Errorf("tier %d: bonus must be non-negative", i)
+		}
+		if math.IsNaN(t.Multiplier) || math.IsInf(t.Multiplier, 0) || t.Multiplier < 0 {
+			return nil, fmt.Errorf("tier %d: multiplier must be non-negative", i)
+		}
+		if i > 0 && t.Min <= tiers[i-1].Min {
+			return nil, fmt.Errorf("tier %d: min must be strictly greater than previous min", i)
+		}
+	}
+	return tiers, nil
+}
+
+// NormalizeRechargeBonusTiers 返回解析后的档位（升序排列）；空/非法时回退默认档位并记录日志。
+func NormalizeRechargeBonusTiers(raw string) []RechargeBonusTier {
+	tiers, err := ParseRechargeBonusTiers(raw)
+	if err != nil || len(tiers) == 0 {
+		if raw != "" {
+			slog.Warn("invalid recharge bonus tiers, falling back to defaults", "raw", raw, "error", err)
+		}
+		return DefaultRechargeBonusTiers
+	}
+	return tiers
+}
+
+// MatchRechargeBonusTier 返回金额命中的最高档位（min <= amount 中 min 最大的），无匹配返回 nil。
+func MatchRechargeBonusTier(tiers []RechargeBonusTier, amount float64) *RechargeBonusTier {
+	best := -1
+	for i, t := range tiers {
+		if amount >= t.Min && (best < 0 || t.Min > tiers[best].Min) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return nil
+	}
+	t := tiers[best]
+	return &t
+}
+
+// formatRechargeBonusTiers 序列化档位为紧凑 JSON。
+func formatRechargeBonusTiers(tiers []RechargeBonusTier) (string, error) {
+	b, err := json.Marshal(tiers)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// sortRechargeBonusTiers 按 min 升序排列。
+func sortRechargeBonusTiers(tiers []RechargeBonusTier) {
+	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Min < tiers[j].Min })
+}
 
 // PaymentConfig holds the payment system configuration.
 type PaymentConfig struct {
@@ -80,6 +182,9 @@ type PaymentConfig struct {
 	AlipayForceQRCode bool `json:"alipay_force_qrcode"`
 	// Use Alipay face-to-face precreate and an app deep link on mobile clients.
 	AlipayMobilePrecreateDeepLink bool `json:"alipay_mobile_precreate_deep_link"`
+
+	// RechargeBonusTiers 充值阶梯奖励配置 JSON（默认档位见 DefaultRechargeBonusTiers）。
+	RechargeBonusTiers string `json:"recharge_bonus_tiers"`
 }
 
 // UpdatePaymentConfigRequest contains fields to update payment configuration.
@@ -117,6 +222,9 @@ type UpdatePaymentConfigRequest struct {
 	VisibleMethodWxpaySource   *string `json:"payment_visible_method_wxpay_source"`
 	VisibleMethodAlipayEnabled *bool   `json:"payment_visible_method_alipay_enabled"`
 	VisibleMethodWxpayEnabled  *bool   `json:"payment_visible_method_wxpay_enabled"`
+
+	// RechargeBonusTiers 充值阶梯奖励 JSON；nil = 不修改。
+	RechargeBonusTiers *string `json:"recharge_bonus_tiers"`
 }
 
 // MethodLimits holds per-payment-type limits.
@@ -198,6 +306,11 @@ type PaymentConfigService struct {
 	entClient     *dbent.Client
 	settingRepo   SettingRepository
 	encryptionKey []byte
+
+	bonusMu        sync.Mutex
+	bonusTiers     []RechargeBonusTier
+	bonusTiersAt   time.Time
+	bonusTiersJSON string
 }
 
 // NewPaymentConfigService creates a new PaymentConfigService.
@@ -206,15 +319,69 @@ func NewPaymentConfigService(entClient *dbent.Client, settingRepo SettingReposit
 }
 
 // GetSettingValue returns a raw setting value ("" if not found or on error).
+// Bonus tier settings are cached with a short TTL to avoid a DB hit per recharge.
 func (s *PaymentConfigService) GetSettingValue(ctx context.Context, key string) string {
 	if s == nil || s.settingRepo == nil {
 		return ""
 	}
+	if key == SettingRechargeBonusTiers {
+		return s.getBonusTiersJSON(ctx)
+	}
 	val, err := s.settingRepo.GetValue(ctx, key)
 	if err != nil {
+		slog.Warn("get setting value failed", "key", key, "error", err)
 		return ""
 	}
 	return val
+}
+
+// getBonusTiersJSON returns the raw bonus tier JSON, cached with a TTL.
+func (s *PaymentConfigService) getBonusTiersJSON(ctx context.Context) string {
+	s.bonusMu.Lock()
+	defer s.bonusMu.Unlock()
+	if !s.bonusTiersAt.IsZero() && time.Since(s.bonusTiersAt) < rechargeBonusCacheTTL {
+		return s.bonusTiersJSON
+	}
+	val, err := s.settingRepo.GetValue(ctx, SettingRechargeBonusTiers)
+	if err != nil {
+		if !errors.Is(err, ErrSettingNotFound) {
+			slog.Warn("get recharge bonus tiers failed", "error", err)
+		}
+		// 未配置或读取失败：回退默认档位（缓存的 JSON 为空串时调用方会用默认值）
+		val = ""
+	}
+	s.bonusTiersJSON = val
+	s.bonusTiersAt = time.Now()
+	return val
+}
+
+// GetRechargeBonusTiers returns the parsed, sorted bonus tiers (defaults when unset/invalid).
+func (s *PaymentConfigService) GetRechargeBonusTiers(ctx context.Context) []RechargeBonusTier {
+	if s == nil {
+		return DefaultRechargeBonusTiers
+	}
+	raw := s.getBonusTiersJSON(ctx)
+	s.bonusMu.Lock()
+	defer s.bonusMu.Unlock()
+	if s.bonusTiers != nil && s.bonusTiersJSON == raw {
+		return s.bonusTiers
+	}
+	tiers := NormalizeRechargeBonusTiers(raw)
+	s.bonusTiers = tiers
+	return tiers
+}
+
+// RechargeBonusForOrder returns the bonus and effective multiplier for a recharge amount.
+// effectiveMultiplier is the tier multiplier when set (>0), else global.
+func (s *PaymentConfigService) RechargeBonusForOrder(ctx context.Context, amount float64, globalMultiplier float64) (bonus float64, effectiveMultiplier float64) {
+	tier := MatchRechargeBonusTier(s.GetRechargeBonusTiers(ctx), amount)
+	if tier == nil {
+		return 0, globalMultiplier
+	}
+	if tier.Multiplier > 0 {
+		globalMultiplier = tier.Multiplier
+	}
+	return tier.Bonus, globalMultiplier
 }
 
 // IsPaymentEnabled returns whether the payment system is enabled.
@@ -239,6 +406,7 @@ func (s *PaymentConfigService) GetPaymentConfig(ctx context.Context) (*PaymentCo
 		SettingAlipayForceQRCode, SettingAlipayMobilePrecreateDeepLink,
 		SettingPaymentVisibleMethodAlipayEnabled, SettingPaymentVisibleMethodAlipaySource,
 		SettingPaymentVisibleMethodWxpayEnabled, SettingPaymentVisibleMethodWxpaySource,
+		SettingRechargeBonusTiers,
 	}
 	vals, err := s.settingRepo.GetMultiple(ctx, keys)
 	if err != nil {
@@ -276,6 +444,7 @@ func (s *PaymentConfigService) parsePaymentConfig(vals map[string]string) *Payme
 
 		AlipayForceQRCode:             vals[SettingAlipayForceQRCode] == "true",
 		AlipayMobilePrecreateDeepLink: vals[SettingAlipayMobilePrecreateDeepLink] == "true",
+		RechargeBonusTiers:            normalizeBonusTiersJSON(vals[SettingRechargeBonusTiers]),
 	}
 	cfg.AlipayMobilePrecreateDeepLink = pcEnvBoolOverride(
 		SettingAlipayMobilePrecreateDeepLink,
@@ -295,6 +464,14 @@ func (s *PaymentConfigService) parsePaymentConfig(vals map[string]string) *Payme
 		cfg.EnabledTypes = NormalizeVisibleMethods(types)
 	}
 	return cfg
+}
+
+// normalizeBonusTiersJSON 返回规范化的档位 JSON（空/非法时回退默认档位序列化）。
+func normalizeBonusTiersJSON(raw string) string {
+	if _, err := ParseRechargeBonusTiers(raw); err == nil && strings.TrimSpace(raw) != "" {
+		return raw
+	}
+	return defaultRechargeBonusTiersJSON
 }
 
 func pcEnvBoolOverride(key string, fallback bool) bool {
@@ -437,7 +614,29 @@ func (s *PaymentConfigService) UpdatePaymentConfig(ctx context.Context, req Upda
 	if req.VisibleMethodWxpayEnabled != nil {
 		m[SettingPaymentVisibleMethodWxpayEnabled] = formatBoolOrEmpty(req.VisibleMethodWxpayEnabled)
 	}
+	if req.RechargeBonusTiers != nil {
+		tiers, err := ParseRechargeBonusTiers(*req.RechargeBonusTiers)
+		if err != nil {
+			return infraerrors.BadRequest("INVALID_RECHARGE_BONUS_TIERS", err.Error())
+		}
+		sortRechargeBonusTiers(tiers)
+		jsonStr, err := formatRechargeBonusTiers(tiers)
+		if err != nil {
+			return infraerrors.BadRequest("INVALID_RECHARGE_BONUS_TIERS", "failed to serialize recharge bonus tiers")
+		}
+		m[SettingRechargeBonusTiers] = jsonStr
+		s.invalidateBonusCache()
+	}
 	return s.settingRepo.SetMultiple(ctx, m)
+}
+
+// invalidateBonusCache 清空档位缓存。
+func (s *PaymentConfigService) invalidateBonusCache() {
+	s.bonusMu.Lock()
+	defer s.bonusMu.Unlock()
+	s.bonusTiersJSON = ""
+	s.bonusTiers = nil
+	s.bonusTiersAt = time.Time{}
 }
 
 func formatBoolOrEmpty(v *bool) string {

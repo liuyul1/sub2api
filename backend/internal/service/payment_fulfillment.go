@@ -30,9 +30,6 @@ var ErrOrderNotFound = errors.New("payment order not found")
 
 const paymentFulfillmentLeaseDuration = 5 * time.Minute
 
-// SettingRechargeBonusTiers 充值阶梯奖励配置（JSON: [{"min":50,"bonus":5}]）
-const SettingRechargeBonusTiers = "RECHARGE_BONUS_TIERS"
-
 type paymentFulfillmentLease struct {
 	version time.Time
 }
@@ -337,10 +334,15 @@ func (s *PaymentService) doBalance(ctx context.Context, o *dbent.PaymentOrder, l
 
 	switch action {
 	case redeemActionSkipCompleted:
+		// Code already created and redeemed — ensure bonus is applied (idempotent),
+		// then mark completed.
+		if err := s.applyRechargeBonus(ctx, o); err != nil {
+			slog.Error("recharge bonus failed on retry", "orderID", o.ID, "error", err)
+			// Don't fail the entire order for bonus errors
+		}
 		if err := s.applyAffiliateRebateForOrder(ctx, o); err != nil {
 			return err
 		}
-		// Code already created and redeemed — just mark completed
 		return s.markCompleted(ctx, o, lease, "RECHARGE_SUCCESS")
 	case redeemActionCreate:
 		rc := &RedeemCode{Code: o.RechargeCode, Type: RedeemTypeBalance, Value: o.Amount, Status: StatusUnused}
@@ -354,12 +356,11 @@ func (s *PaymentService) doBalance(ctx context.Context, o *dbent.PaymentOrder, l
 		return fmt.Errorf("redeem balance: %w", err)
 	}
 
-	// Tiered recharge bonus: apply bonus credits based on recharge amount
-	if bonus := s.calculateRechargeBonus(o.Amount); bonus > 0 {
-		if err := s.applyRechargeBonus(ctx, o, bonus); err != nil {
-			slog.Error("recharge bonus failed", "orderID", o.ID, "bonus", bonus, "error", err)
-			// Don't fail the entire order for bonus errors
-		}
+	// Tiered recharge bonus: apply bonus credits based on recharge amount.
+	// Idempotent: deterministic bonus code per order, so retries never double-credit.
+	if err := s.applyRechargeBonus(ctx, o); err != nil {
+		slog.Error("recharge bonus failed", "orderID", o.ID, "error", err)
+		// Don't fail the entire order for bonus errors
 	}
 
 	if err := s.applyAffiliateRebateForOrder(ctx, o); err != nil {
@@ -368,50 +369,48 @@ func (s *PaymentService) doBalance(ctx context.Context, o *dbent.PaymentOrder, l
 	return s.markCompleted(ctx, o, lease, "RECHARGE_SUCCESS")
 }
 
-// calculateRechargeBonus returns the bonus amount based on recharge tiers.
-// Tiers are stored in settings as JSON: [{"min":50,"bonus":5},{"min":100,"bonus":15}]
-// Returns 0 if no tier matches or tiers are not configured.
-func (s *PaymentService) calculateRechargeBonus(amount float64) float64 {
-	tiersJSON := s.getSettingValue(SettingRechargeBonusTiers)
-	if tiersJSON == "" {
-		return 0
+// applyRechargeBonus credits the tier bonus (if any) to the user's balance.
+// Uses a deterministic bonus code derived from the order ID so the operation is
+// idempotent across retries: if the code already exists it is either redeemed
+// (recovering a previously orphaned code) or skipped (already applied).
+func (s *PaymentService) applyRechargeBonus(ctx context.Context, o *dbent.PaymentOrder) error {
+	if o == nil || s.configService == nil || s.redeemService == nil {
+		return nil
 	}
-
-	type tier struct {
-		Min   float64 `json:"min"`
-		Bonus float64 `json:"bonus"`
+	// 档位基准：实付金额（PayAmount）。Amount 已含倍率，用它会双重叠加。
+	base := o.PayAmount
+	if base <= 0 {
+		base = o.Amount
 	}
-
-	var tiers []tier
-	if err := json.Unmarshal([]byte(tiersJSON), &tiers); err != nil {
-		slog.Error("failed to parse recharge bonus tiers", "error", err)
-		return 0
-	}
-
-	// Find the highest matching tier
-	var bestBonus float64
-	for _, t := range tiers {
-		if amount >= t.Min && t.Bonus > bestBonus {
-			bestBonus = t.Bonus
-		}
-	}
-	return bestBonus
-}
-
-// applyRechargeBonus credits bonus amount to the user's balance.
-func (s *PaymentService) applyRechargeBonus(ctx context.Context, o *dbent.PaymentOrder, bonus float64) error {
+	bonus, _ := s.configService.RechargeBonusForOrder(ctx, base, 0)
 	if bonus <= 0 {
 		return nil
 	}
 
-	// Create a redeem code for the bonus
-	bonusCode := fmt.Sprintf("bonus_%s_%d", o.RechargeCode, time.Now().UnixMilli())
+	// Deterministic, length-safe (<32 chars): B<orderID>
+	bonusCode := fmt.Sprintf("B%d", o.ID)
+	existing, lookupErr := s.redeemService.GetByCode(ctx, bonusCode)
+	if lookupErr == nil && existing != nil {
+		if existing.IsUsed() {
+			// Already applied in a previous run — idempotent skip.
+			return nil
+		}
+		// Exists but unused (orphaned from a partial run) — redeem it now.
+		if _, err := s.redeemService.Redeem(ContextSkipRedeemAffiliate(ctx), o.UserID, bonusCode); err != nil {
+			return fmt.Errorf("redeem orphan bonus: %w", err)
+		}
+		s.writeAuditLog(ctx, o.ID, "RECHARGE_BONUS_APPLIED", "system", map[string]any{
+			"bonusAmount": bonus,
+			"bonusCode":   bonusCode,
+		})
+		slog.Info("recharge bonus applied (recovered)", "orderID", o.ID, "bonus", bonus, "code", bonusCode)
+		return nil
+	}
+
 	rc := &RedeemCode{Code: bonusCode, Type: RedeemTypeBalance, Value: bonus, Status: StatusUnused}
 	if err := s.redeemService.CreateCode(ctx, rc); err != nil {
 		return fmt.Errorf("create bonus redeem code: %w", err)
 	}
-
-	// Redeem the bonus code
 	if _, err := s.redeemService.Redeem(ContextSkipRedeemAffiliate(ctx), o.UserID, bonusCode); err != nil {
 		return fmt.Errorf("redeem bonus: %w", err)
 	}
@@ -423,16 +422,6 @@ func (s *PaymentService) applyRechargeBonus(ctx context.Context, o *dbent.Paymen
 
 	slog.Info("recharge bonus applied", "orderID", o.ID, "bonus", bonus, "code", bonusCode)
 	return nil
-}
-
-// getSettingValue retrieves a setting value from the database.
-func (s *PaymentService) getSettingValue(key string) string {
-	if s.configService == nil {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return s.configService.GetSettingValue(ctx, key)
 }
 
 func (s *PaymentService) markCompleted(ctx context.Context, o *dbent.PaymentOrder, lease *paymentFulfillmentLease, auditAction string) error {

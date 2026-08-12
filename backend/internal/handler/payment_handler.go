@@ -118,6 +118,13 @@ func (h *PaymentHandler) GetCheckoutInfo(c *gin.Context) {
 		}
 	}
 
+	// 充值阶梯奖励：用于前端醒目展示「充X送Y」+ 档位专属倍率
+	bonusTiers := h.configService.GetRechargeBonusTiers(ctx)
+	bonusTierList := make([]rechargeBonusTierDTO, 0, len(bonusTiers))
+	for _, t := range bonusTiers {
+		bonusTierList = append(bonusTierList, rechargeBonusTierDTO{Min: t.Min, Bonus: t.Bonus, Multiplier: t.Multiplier})
+	}
+
 	// Fetch plans with group info
 	plans, _ := h.configService.ListPlansForSale(ctx)
 	groupInfo := h.configService.GetGroupInfoMap(ctx, plans)
@@ -154,7 +161,14 @@ func (h *PaymentHandler) GetCheckoutInfo(c *gin.Context) {
 		StripePublishableKey:          cfg.StripePublishableKey,
 		AlipayForceQRCode:             cfg.AlipayForceQRCode,
 		AlipayMobilePrecreateDeepLink: alipayMobilePrecreateDeepLink,
+		RechargeBonusTiers:            bonusTierList,
 	})
+}
+
+type rechargeBonusTierDTO struct {
+	Min        float64 `json:"min"`
+	Bonus      float64 `json:"bonus"`
+	Multiplier float64 `json:"multiplier,omitempty"`
 }
 
 type checkoutInfoResponse struct {
@@ -171,6 +185,7 @@ type checkoutInfoResponse struct {
 	StripePublishableKey          string                          `json:"stripe_publishable_key"`
 	AlipayForceQRCode             bool                            `json:"alipay_force_qrcode"`
 	AlipayMobilePrecreateDeepLink bool                            `json:"alipay_mobile_precreate_deep_link"`
+	RechargeBonusTiers            []rechargeBonusTierDTO          `json:"recharge_bonus_tiers"`
 }
 
 type checkoutPlan struct {

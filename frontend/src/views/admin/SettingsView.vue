@@ -7787,6 +7787,51 @@
                   </div>
                   <div>
                     <label class="input-label">{{
+                      t("admin.settings.payment.rechargeBonusTiers")
+                    }}</label>
+                    <textarea
+                      :value="form.payment_recharge_bonus_tiers || ''"
+                      @input="
+                        form.payment_recharge_bonus_tiers = (
+                          $event.target as HTMLTextAreaElement
+                        ).value
+                      "
+                      rows="5"
+                      spellcheck="false"
+                      class="input font-mono text-xs"
+                      :placeholder="
+                        t(
+                          'admin.settings.payment.rechargeBonusTiersPlaceholder',
+                        )
+                      "
+                    ></textarea>
+                    <p
+                      v-if="rechargeBonusTiersError"
+                      class="mt-1 text-xs text-red-600 dark:text-red-400"
+                    >
+                      {{ rechargeBonusTiersError }}
+                    </p>
+                    <p v-else class="mt-0.5 text-xs text-gray-400">
+                      {{ t("admin.settings.payment.rechargeBonusTiersHint") }}
+                    </p>
+                    <div
+                      v-if="parsedRechargeBonusTiers.length > 0"
+                      class="mt-2 flex flex-wrap gap-1.5"
+                    >
+                      <span
+                        v-for="tier in parsedRechargeBonusTiers"
+                        :key="tier.min"
+                        class="inline-flex items-center gap-1 rounded bg-primary-50 px-2 py-0.5 text-[11px] font-medium text-primary-700 dark:bg-primary-900/30 dark:text-primary-300"
+                      >
+                        ≥{{ tier.min }} → 送{{ tier.bonus
+                        }}<template v-if="tier.multiplier > 0">
+                          ·×{{ tier.multiplier }}</template
+                        >
+                      </span>
+                    </div>
+                  </div>
+                  <div>
+                    <label class="input-label">{{
                       t("admin.settings.payment.subscriptionUsdToCnyRate")
                     }}</label>
                     <input
@@ -9468,6 +9513,7 @@ const form = reactive<SettingsForm>({
   payment_order_timeout_minutes: 30,
   payment_balance_disabled: false,
   payment_balance_recharge_multiplier: 1,
+  payment_recharge_bonus_tiers: "",
   payment_subscription_usd_to_cny_rate: 0,
   payment_recharge_fee_rate: 0,
   payment_enabled_types: [],
@@ -10646,6 +10692,61 @@ const codexSyncedVersionLabel = computed(() => {
   });
 });
 
+interface RechargeBonusTierRow {
+  min: number;
+  bonus: number;
+  multiplier: number;
+}
+
+// 充值阶梯奖励 JSON 校验与解析（预览用，最终以后端校验为准）
+const parsedRechargeBonusTiers = computed<RechargeBonusTierRow[]>(() => {
+  const raw = form.payment_recharge_bonus_tiers?.trim();
+  if (!raw) return [];
+  try {
+    const tiers = JSON.parse(raw) as Array<Record<string, unknown>>;
+    if (!Array.isArray(tiers)) return [];
+    const rows: RechargeBonusTierRow[] = [];
+    for (const item of tiers) {
+      const min = Number(item.min);
+      const bonus = Number(item.bonus);
+      const multiplier = Number(item.multiplier ?? 0);
+      if (!Number.isFinite(min) || !Number.isFinite(bonus) || !Number.isFinite(multiplier)) {
+        return [];
+      }
+      rows.push({ min, bonus, multiplier });
+    }
+    return rows;
+  } catch {
+    return [];
+  }
+});
+const rechargeBonusTiersError = computed(() => {
+  const raw = form.payment_recharge_bonus_tiers?.trim();
+  if (!raw) return "";
+  try {
+    const tiers = JSON.parse(raw);
+    if (!Array.isArray(tiers) || tiers.length === 0) {
+      return t("admin.settings.payment.rechargeBonusTiersInvalid");
+    }
+    let prevMin = -Infinity;
+    for (const item of tiers as Array<Record<string, unknown>>) {
+      const min = Number(item.min);
+      const bonus = Number(item.bonus);
+      const multiplier = Number(item.multiplier ?? 0);
+      if (!Number.isFinite(min) || min <= 0 || !Number.isFinite(bonus) || bonus < 0 || !Number.isFinite(multiplier) || multiplier < 0) {
+        return t("admin.settings.payment.rechargeBonusTiersInvalid");
+      }
+      if (min <= prevMin) {
+        return t("admin.settings.payment.rechargeBonusTiersInvalid");
+      }
+      prevMin = min;
+    }
+    return "";
+  } catch {
+    return t("admin.settings.payment.rechargeBonusTiersInvalid");
+  }
+});
+
 async function loadSettings() {
   loading.value = true;
   loadFailed.value = false;
@@ -11267,6 +11368,9 @@ async function saveSettings() {
       payment_balance_disabled: form.payment_balance_disabled,
       payment_balance_recharge_multiplier:
         Number(form.payment_balance_recharge_multiplier) || 1,
+      payment_recharge_bonus_tiers: form.payment_recharge_bonus_tiers?.trim()
+        ? form.payment_recharge_bonus_tiers
+        : "",
       payment_subscription_usd_to_cny_rate:
         Number(form.payment_subscription_usd_to_cny_rate) || 0,
       payment_recharge_fee_rate: Number(form.payment_recharge_fee_rate) || 0,
