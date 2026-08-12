@@ -422,6 +422,7 @@ export default {
     bonusCurrent: '当前档位',
     bonusMultiplier: '到账倍率 ×{rate}',
     bonusRewardRow: '充值奖励',
+    creditedBalanceTotal: '到账总额',
     refundReason: '退款原因',
     refundReasonPlaceholder: '请描述您的退款原因',
     stripeLoadFailed: '支付组件加载失败，请刷新页面重试',

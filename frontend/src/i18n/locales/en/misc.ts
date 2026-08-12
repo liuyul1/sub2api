@@ -398,6 +398,7 @@ export default {
     bonusCurrent: 'Current tier',
     bonusMultiplier: 'Credit rate ×{rate}',
     bonusRewardRow: 'Bonus',
+    creditedBalanceTotal: 'Credited Total',
     refundReason: 'Refund Reason',
     refundReasonPlaceholder: 'Please describe your refund reason',
     stripeLoadFailed: 'Failed to load payment component. Please refresh and try again.',
