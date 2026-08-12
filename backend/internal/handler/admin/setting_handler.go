@@ -362,6 +362,7 @@ func (h *SettingHandler) GetSettings(c *gin.Context) {
 		PaymentProductNameSuffix:                               paymentCfg.ProductNameSuffix,
 		PaymentHelpImageURL:                                    paymentCfg.HelpImageURL,
 		PaymentHelpText:                                        paymentCfg.HelpText,
+		PaymentRechargeBonusTiers:                              paymentCfg.RechargeBonusTiers,
 		PaymentCancelRateLimitEnabled:                          paymentCfg.CancelRateLimitEnabled,
 		PaymentCancelRateLimitMax:                              paymentCfg.CancelRateLimitMax,
 		PaymentCancelRateLimitWindow:                           paymentCfg.CancelRateLimitWindow,
